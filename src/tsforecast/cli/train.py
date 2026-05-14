@@ -405,7 +405,7 @@ def _run_per_ticker(
                 ticker=ticker,
                 save_path=tracker.ticker_return_plot_path(ticker),
             )
-            tracker.save_ticker_model(model, ticker)
+            #tracker.save_ticker_model(model, ticker)
 
             ticker_metrics_list.append(ticker_metrics)
             logger.info(
