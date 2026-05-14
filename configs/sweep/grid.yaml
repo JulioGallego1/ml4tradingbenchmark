@@ -6,13 +6,13 @@ regimes:
   - newest
 
 horizons:
-  #- 1
-  - 10    # 2w
+  - 1
+  #- 10    # 2w
   #- 21    # 1m
   #- 63    # 3m
 
 context_lengths:
-  #- 22
+  - 22
   - 32
   - 48
   #- 96
@@ -55,8 +55,8 @@ models:
     d_model: [64, 128]
     num_attention_heads: [4, 8]
     num_hidden_layers: [3]
-    patch_length: [2]
-    patch_stride: [1]
+    patch_length: [1, 2]
+    patch_stride: [0]
     dropout: [0.2]
     lr: [0.0015]
     use_window_scaling: [true, false]
