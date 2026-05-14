@@ -55,7 +55,7 @@ models:
     d_model: [64, 128]
     num_attention_heads: [4, 8]
     num_hidden_layers: [2, 3]
-    patch_length: [1]
+    patch_length: [1, 2]
     patch_stride: [0]
     dropout: [0.2]
     lr: 0.0015
