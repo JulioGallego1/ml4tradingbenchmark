@@ -1,0 +1,4 @@
+max_epochs: 250
+batch_size: 32
+patience: 25
+seed: 2024

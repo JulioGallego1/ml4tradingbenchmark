@@ -1,0 +1,2 @@
+[console_scripts]
+tsforecast-train = tsforecast.cli.train:main
