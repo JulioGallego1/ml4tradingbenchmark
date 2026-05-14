@@ -6,13 +6,13 @@ regimes:
   - newest
 
 horizons:
-  - 1
-  #- 10    # 2w
+  #- 1
+  - 10    # 2w
   #- 21    # 1m
   #- 63    # 3m
 
 context_lengths:
-  - 22
+  #- 22
   - 32
   - 48
   #- 96
