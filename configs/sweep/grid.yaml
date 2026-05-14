@@ -3,24 +3,26 @@
 regimes:
   #- bear
   #- bull
-  #- newest
+  - newest
 
 horizons:
-  - 10    # 2w
-  - 21    # 1m
-  - 63    # 3m
+  - 1
+  #- 10    # 2w
+  #- 21    # 1m
+  #- 63    # 3m
 
 context_lengths:
+  - 22
   - 32
   - 48
-  - 96
+  #- 96
 
 strategies:
   - mimo
   #- recursive
 
 steps:       # only used when strategy = recursive
-  - 1
+  #- 1
   #- 32
 
 training_mode:
@@ -31,14 +33,14 @@ seeds:
 
 global_scalers:
   - none
-  #- minmax
-  #- zscore
+  - minmax
+  - zscore
 
 models:
   rf:
     n_estimators: [200]
     max_depth: [null, 10]
-    max_features: ["sqrt"]
+    max_features: [1, "sqrt"]
     min_samples_leaf: [1, 2]
 
   lstm:
@@ -53,8 +55,9 @@ models:
     d_model: [64, 128]
     num_attention_heads: [4, 8]
     num_hidden_layers: [2, 3]
-    patch_length: [16]
-    patch_stride: [8]
+    patch_length: [1, 2, 4]
+    patch_stride: [0, 1, 2]
     dropout: [0.2]
     lr: [0.0015, 0.0003]
-    use_window_scaling: [true]
+    norm_type: [layernorm, batchnorm]
+    use_window_scaling: [true, false]
