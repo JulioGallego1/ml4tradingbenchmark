@@ -58,5 +58,5 @@ models:
     patch_length: [1, 2]
     patch_stride: [0]
     dropout: [0.2]
-    lr: 0.0015
+    lr: [0.0015]
     use_window_scaling: [true, false]
