@@ -71,6 +71,19 @@ import yaml
 
 
 # ── Family definitions ────────────────────────────────────────────────────────
+#
+# Two grouping levels coexist:
+#
+#   • base family  = (model, strategy)  →  5 categories
+#       Used by per-cell bar charts, tables, heatmaps. Drives color.
+#
+#   • full family  = (model, strategy, global_scaler, window_scaling)
+#       Used by line plots so the legend reflects scaling choices, e.g.:
+#         "LSTM | MIMO | g=minmax | w=yes"
+#         "PatchTST | recursive | g=none | w=yes"
+#       Within one base color, linestyle encodes window scaling (solid=yes,
+#       dashed=no) and marker encodes the global scaler. Line plots cap at
+#       MAX_LINES families to stay readable; selection is by average rank.
 
 FAMILY_ORDER = ["RF", "LSTM_mimo", "LSTM_recursive", "PATCHTST_mimo", "PATCHTST_recursive"]
 
@@ -90,13 +103,21 @@ FAMILY_COLORS = {
     "PATCHTST_recursive": "#8963BA",
 }
 
-FAMILY_MARKERS = {
-    "RF":                 "o",
-    "LSTM_mimo":          "s",
-    "LSTM_recursive":     "^",
-    "PATCHTST_mimo":      "D",
-    "PATCHTST_recursive": "P",
+# Markers vary by global scaler so multiple lines in the same base color
+# remain distinguishable. Unknown values fall back to a circle.
+GLOBAL_SCALER_MARKERS = {
+    "none":     "o",
+    "minmax":   "s",
+    "std":      "^",
+    "standard": "^",
+    "robust":   "D",
+    "zscore":   "^",
 }
+
+# Cap the number of lines drawn in any line plot. Anything above this is
+# dropped (lowest-ranked families on the metric being shown). Picked so the
+# legend stays scannable.
+MAX_LINES = 8
 
 
 # ── Visual config ─────────────────────────────────────────────────────────────
@@ -177,13 +198,37 @@ def load_all_runs(runs_dir: str = "runs") -> pd.DataFrame:
     return pd.DataFrame(records) if records else pd.DataFrame()
 
 
-def build_family_label(row) -> str:
-    """5 families: RF | LSTM_mimo | LSTM_recursive | PATCHTST_mimo | PATCHTST_recursive."""
+def _model_display(model: str) -> str:
+    return {"PATCHTST": "PatchTST"}.get(model, model)
+
+
+def _global_scaler_value(row) -> str:
+    gs = row.get("global_scaler", "none")
+    if gs is None or (isinstance(gs, float) and np.isnan(gs)):
+        return "none"
+    return str(gs)
+
+
+def _window_scaling_value(row) -> str:
+    return "yes" if bool(row.get("use_window_scaling", False)) else "no"
+
+
+def base_family_label(row) -> str:
+    """5 base families: RF | LSTM_mimo | LSTM_recursive | PATCHTST_mimo | PATCHTST_recursive."""
     model = row["model"]
-    strategy = row["strategy"]
     if model == "RF":
         return "RF"
-    return f"{model}_{strategy}"
+    return f"{model}_{row['strategy']}"
+
+
+def full_family_label(row) -> str:
+    """Rich label including scaling. E.g. 'LSTM | MIMO | g=minmax | w=yes'."""
+    model = _model_display(row["model"])
+    g = _global_scaler_value(row)
+    w = _window_scaling_value(row)
+    if row["model"] == "RF":
+        return f"{model} | g={g} | w={w}"
+    return f"{model} | {row['strategy']} | g={g} | w={w}"
 
 
 def get_color(family: str) -> str:
@@ -194,8 +239,22 @@ def short_family_label(family: str) -> str:
     return FAMILY_LABELS.get(family, family)
 
 
+def style_for_full_family(rep_row):
+    """Return (color, linestyle, marker) for a line representing one full family.
+
+    rep_row is any row belonging to the full family; since the full family
+    encodes (model, strategy, global_scaler, window_scaling), every row in the
+    line shares the visual attributes.
+    """
+    base = base_family_label(rep_row)
+    color = FAMILY_COLORS.get(base, "#999999")
+    linestyle = "-" if bool(rep_row.get("use_window_scaling", False)) else "--"
+    marker = GLOBAL_SCALER_MARKERS.get(_global_scaler_value(rep_row), "o")
+    return color, linestyle, marker
+
+
 def variant_label(row) -> str:
-    """Compact description of the hyperparameter variant within a family."""
+    """Per-point variant info (everything *not* already in the full family label)."""
     parts = [f"L={int(row['L'])}"]
     if row.get("patch_length") is not None and not (
         isinstance(row["patch_length"], float) and np.isnan(row["patch_length"])
@@ -203,12 +262,81 @@ def variant_label(row) -> str:
         parts.append(f"pl={int(row['patch_length'])}")
     if row.get("rec_step", 0):
         parts.append(f"stp={int(row['rec_step'])}")
-    if row.get("use_window_scaling", False):
-        parts.append("winscale")
-    gs = row.get("global_scaler", "none")
-    if gs and gs != "none":
-        parts.append(f"gs={gs}")
     return ", ".join(parts)
+
+
+def _pick_top_full_families(
+    df_subset: pd.DataFrame,
+    metric: str,
+    lower_is_better: bool,
+    max_lines: int = MAX_LINES,
+    extra_group: list[str] | None = None,
+) -> tuple[list[str], pd.DataFrame]:
+    """Take best (full-family, H[, extra]) row for the metric, then rank families
+    by mean metric across horizons and keep the top ``max_lines``.
+
+    Returns (ordered top family_full keys, dataframe restricted to those keys).
+    """
+    valid = df_subset.dropna(subset=[metric])
+    if valid.empty:
+        return [], valid
+
+    group_cols = ["family_full", "H"] + (extra_group or [])
+    if lower_is_better:
+        best_idx = valid.groupby(group_cols)[metric].idxmin()
+    else:
+        best_idx = valid.groupby(group_cols)[metric].idxmax()
+    best = valid.loc[best_idx]
+    summary = best.groupby("family_full")[metric].mean()
+    summary = summary.sort_values(ascending=lower_is_better)
+    top = summary.head(max_lines).index.tolist()
+    return top, best[best["family_full"].isin(top)]
+
+
+def _pick_top_full_families_multi(
+    df_subset: pd.DataFrame,
+    metric_specs: list[tuple[str, bool]],
+    max_lines: int = MAX_LINES,
+) -> tuple[list[str], dict[str, pd.DataFrame], int]:
+    """Pick top families by average rank across multiple metrics.
+
+    Returns (top family_full keys ordered best-first,
+             {metric -> dataframe of best (family_full, H) rows restricted to top},
+             total family count before capping).
+    """
+    rank_sum: dict[str, float] = {}
+    rank_count: dict[str, int] = {}
+    best_by_metric: dict[str, pd.DataFrame] = {}
+    seen_families: set[str] = set()
+
+    for metric, lib in metric_specs:
+        valid = df_subset.dropna(subset=[metric])
+        if valid.empty:
+            best_by_metric[metric] = valid
+            continue
+        if lib:
+            idx = valid.groupby(["family_full", "H"])[metric].idxmin()
+        else:
+            idx = valid.groupby(["family_full", "H"])[metric].idxmax()
+        best = valid.loc[idx]
+        best_by_metric[metric] = best
+        means = best.groupby("family_full")[metric].mean()
+        seen_families.update(means.index)
+        ranks = means.rank(ascending=lib, method="min")
+        for fam, r in ranks.items():
+            rank_sum[fam] = rank_sum.get(fam, 0.0) + float(r)
+            rank_count[fam] = rank_count.get(fam, 0) + 1
+
+    if not rank_sum:
+        return [], best_by_metric, 0
+
+    avg_rank = {f: rank_sum[f] / rank_count[f] for f in rank_sum}
+    top = sorted(avg_rank, key=avg_rank.get)[:max_lines]
+    top_set = set(top)
+    for metric, df_best in best_by_metric.items():
+        if not df_best.empty:
+            best_by_metric[metric] = df_best[df_best["family_full"].isin(top_set)]
+    return top, best_by_metric, len(seen_families)
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -216,12 +344,12 @@ def variant_label(row) -> str:
 def plot_bar_comparison(data, metric, title, ylabel, save_path, lower_is_better=True):
     if data.empty:
         return
-    sorted_data = data.sort_values(metric, ascending=lower_is_better)
+    sorted_data = data.sort_values(metric, ascending=lower_is_better).reset_index(drop=True)
     families = sorted_data["family"].tolist()
     values   = sorted_data[metric].tolist()
     colors   = [get_color(f) for f in families]
 
-    fig, ax = plt.subplots(figsize=(12, max(4, len(families) * 0.8)))
+    fig, ax = plt.subplots(figsize=(13, max(4, len(families) * 0.9)))
     bars = ax.barh(range(len(families)), values, color=colors, height=0.65,
                    edgecolor="white", linewidth=0.5)
     bars[0].set_edgecolor(ACCENT_GOLD)
@@ -235,8 +363,14 @@ def plot_bar_comparison(data, metric, title, ylabel, save_path, lower_is_better=
                 f"{val:.4f}", va="center", ha="left", fontsize=10,
                 fontweight=weight, color=TEXT_COLOR)
 
+    yticklabels = []
+    for _, row in sorted_data.iterrows():
+        base = short_family_label(row["family"])
+        g = _global_scaler_value(row)
+        w = _window_scaling_value(row)
+        yticklabels.append(f"{base}\n(g={g} | w={w})")
     ax.set_yticks(range(len(families)))
-    ax.set_yticklabels([short_family_label(f) for f in families], fontsize=10)
+    ax.set_yticklabels(yticklabels, fontsize=9)
     ax.set_xlabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold", pad=15, color=TEXT_COLOR)
     ax.text(0.98, 0.02, f"Best: {short_family_label(families[0])}\n({values[0]:.4f})",
@@ -255,8 +389,10 @@ def plot_bar_comparison(data, metric, title, ylabel, save_path, lower_is_better=
 def plot_metrics_table(data, title, save_path):
     if data.empty:
         return
-    cols     = ["family", "mape", "smape", "directional_accuracy", "final_return_mae", "run_id"]
-    headers  = ["Family", "MAPE", "SMAPE", "Dir.Acc.", "FinalRet MAE (pp)", "Run ID"]
+    cols     = ["family", "global_scaler", "use_window_scaling",
+                "mape", "smape", "directional_accuracy", "final_return_mae", "run_id"]
+    headers  = ["Family", "Global", "Window",
+                "MAPE", "SMAPE", "Dir.Acc.", "FinalRet MAE (pp)", "Run ID"]
     available = [c for c in cols if c in data.columns]
 
     display_data = []
@@ -266,9 +402,13 @@ def plot_metrics_table(data, title, save_path):
             val = row[col]
             if col == "family":
                 formatted.append(short_family_label(str(val)))
+            elif col == "global_scaler":
+                formatted.append(_global_scaler_value(row))
+            elif col == "use_window_scaling":
+                formatted.append(_window_scaling_value(row))
             elif col == "run_id":
                 s = str(val)
-                formatted.append(s[:42] + "…" if len(s) > 42 else s)
+                formatted.append(s[:38] + "…" if len(s) > 38 else s)
             elif col == "final_return_mae" and isinstance(val, float):
                 # Already in percentage points; show the "pp" suffix explicitly.
                 formatted.append("—" if np.isnan(val) else f"{val:.4f} pp")
@@ -280,7 +420,7 @@ def plot_metrics_table(data, title, save_path):
                 formatted.append(str(val))
         display_data.append(formatted)
 
-    fig, ax = plt.subplots(figsize=(18, max(2, len(display_data) * 0.6 + 1.5)))
+    fig, ax = plt.subplots(figsize=(20, max(2, len(display_data) * 0.6 + 1.5)))
     ax.axis("off")
     ax.set_title(title, fontsize=14, fontweight="bold", pad=20, color=TEXT_COLOR)
 
@@ -347,47 +487,51 @@ def plot_heatmap(pivot, title, save_path, lower_is_better=True):
 
 
 def plot_lines_by_horizon(df, regime, metric, title, ylabel, save_path, lower_is_better=True):
-    """Line chart: X=horizon, one line per family, best run per (family, H)."""
-    subset = df[df["regime"] == regime].copy()
+    """Line chart: X=horizon, one line per full family (model+strategy+scaling).
+
+    The set of plotted families is capped at MAX_LINES, selected by mean
+    metric across horizons (best first).
+    """
+    subset = df[df["regime"] == regime].dropna(subset=[metric]).copy()
     if subset.empty:
         return
 
-    if lower_is_better:
-        best_idx = subset.groupby(["family", "H"])[metric].idxmin()
-    else:
-        best_idx = subset.groupby(["family", "H"])[metric].idxmax()
-    best = subset.loc[best_idx]
+    top_families, best = _pick_top_full_families(
+        subset, metric, lower_is_better, max_lines=MAX_LINES
+    )
+    if not top_families:
+        return
+    total_families = subset["family_full"].nunique()
 
-    horizons = sorted(best["H"].unique())
-    families = [f for f in FAMILY_ORDER if f in best["family"].unique()]
-    families += [f for f in best["family"].unique() if f not in FAMILY_ORDER]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for family in families:
-        fam_data = best[best["family"] == family].sort_values("H")
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    for family_full in top_families:
+        fam_data = best[best["family_full"] == family_full].sort_values("H")
         if fam_data.empty:
             continue
+        rep = fam_data.iloc[0]
+        color, linestyle, marker = style_for_full_family(rep)
         h_vals = fam_data["H"].tolist()
         m_vals = fam_data[metric].tolist()
-        color  = get_color(family)
-        marker = FAMILY_MARKERS.get(family, "o")
-        label  = FAMILY_LABELS.get(family, family)
-        ax.plot(h_vals, m_vals, color=color, marker=marker, markersize=8,
-                linewidth=2.2, label=label, zorder=3)
+        ax.plot(h_vals, m_vals, color=color, marker=marker, markersize=7,
+                linewidth=2.0, linestyle=linestyle, label=family_full, zorder=3)
         for h, m in zip(h_vals, m_vals):
-            ax.annotate(f"{m:.1f}", (h, m), textcoords="offset points",
-                        xytext=(0, 10), ha="center", fontsize=7.5,
+            ax.annotate(f"{m:.2f}", (h, m), textcoords="offset points",
+                        xytext=(0, 8), ha="center", fontsize=7,
                         color=color, fontweight="bold")
 
+    horizons = sorted(best["H"].unique())
     ax.set_xticks(horizons)
     ax.set_xticklabels([str(h) for h in horizons])
     ax.set_xlabel("Prediction Horizon (H)", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     regime_label = "Bear Market (2022)" if regime == "bear" else "Bull Market (2023)"
-    ax.set_title(f"{title}\n{regime_label}", fontsize=14, fontweight="bold",
+    suffix = ""
+    if total_families > len(top_families):
+        suffix = f"\n(showing top {len(top_families)} of {total_families} families by mean {metric})"
+    ax.set_title(f"{title}\n{regime_label}{suffix}", fontsize=13, fontweight="bold",
                  color=TEXT_COLOR, pad=15)
-    ax.legend(loc="upper left", fontsize=9, framealpha=0.9,
-              edgecolor="#CCCCCC", fancybox=True)
+    ax.legend(loc="best", fontsize=8.5, framealpha=0.9,
+              edgecolor="#CCCCCC", fancybox=True, title="Family | scaling")
     ax.grid(True, alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -397,56 +541,70 @@ def plot_lines_by_horizon(df, regime, metric, title, ylabel, save_path, lower_is
 
 
 def plot_lines_dual_regime(df, metric, title, ylabel, save_path, lower_is_better=True):
-    """Side-by-side line charts (bear | bull)."""
+    """Side-by-side line charts (bear | bull), shared top-N families."""
     regimes = sorted(df["regime"].unique())
     if len(regimes) < 2:
         plot_lines_by_horizon(df, regimes[0], metric, title, ylabel, save_path, lower_is_better)
         return
 
+    valid = df.dropna(subset=[metric])
+    if valid.empty:
+        return
+
+    top_families, best_all = _pick_top_full_families(
+        valid, metric, lower_is_better, max_lines=MAX_LINES, extra_group=["regime"]
+    )
+    if not top_families:
+        return
+    total_families = valid["family_full"].nunique()
+
     fig, axes = plt.subplots(1, 2, figsize=(18, 7), sharey=True)
-    families  = [f for f in FAMILY_ORDER if f in df["family"].unique()]
-    families += [f for f in df["family"].unique() if f not in FAMILY_ORDER]
+    legend_handles: dict[str, object] = {}
 
     for ax, regime in zip(axes, regimes):
-        subset = df[df["regime"] == regime]
-        if subset.empty:
-            continue
-        if lower_is_better:
-            best_idx = subset.groupby(["family", "H"])[metric].idxmin()
-        else:
-            best_idx = subset.groupby(["family", "H"])[metric].idxmax()
-        best     = subset.loc[best_idx]
-        horizons = sorted(best["H"].unique())
-
-        for family in families:
-            fam_data = best[best["family"] == family].sort_values("H")
-            if fam_data.empty:
-                continue
-            h_vals = fam_data["H"].tolist()
-            m_vals = fam_data[metric].tolist()
-            color  = get_color(family)
-            marker = FAMILY_MARKERS.get(family, "o")
-            label  = FAMILY_LABELS.get(family, family)
-            ax.plot(h_vals, m_vals, color=color, marker=marker, markersize=8,
-                    linewidth=2.2, label=label, zorder=3)
-
-        ax.set_xticks(horizons)
-        ax.set_xticklabels([str(h) for h in horizons])
-        ax.set_xlabel("Prediction Horizon (H)", fontsize=11)
+        regime_data = best_all[best_all["regime"] == regime]
         regime_label = "Bear Market (2022)" if regime == "bear" else "Bull Market (2023)"
+        if regime_data.empty:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center", color="#999999")
+        else:
+            for family_full in top_families:
+                fam_data = regime_data[regime_data["family_full"] == family_full].sort_values("H")
+                if fam_data.empty:
+                    continue
+                rep = fam_data.iloc[0]
+                color, linestyle, marker = style_for_full_family(rep)
+                line, = ax.plot(fam_data["H"], fam_data[metric],
+                                color=color, marker=marker, markersize=7,
+                                linewidth=2.0, linestyle=linestyle,
+                                label=family_full, zorder=3)
+                legend_handles.setdefault(family_full, line)
+            horizons = sorted(regime_data["H"].unique())
+            if horizons:
+                ax.set_xticks(horizons)
+                ax.set_xticklabels([str(h) for h in horizons])
+
+        ax.set_xlabel("Prediction Horizon (H)", fontsize=11)
         ax.set_title(regime_label, fontsize=13, fontweight="bold", color=TEXT_COLOR)
         ax.grid(True, alpha=0.3)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
     axes[0].set_ylabel(ylabel, fontsize=12)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=9,
-               framealpha=0.95, edgecolor="#CCCCCC", fancybox=True,
-               bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle(title, fontsize=15, fontweight="bold", color=TEXT_COLOR, y=1.02)
+    suffix = ""
+    if total_families > len(top_families):
+        suffix = f"  (showing top {len(top_families)} of {total_families} families)"
+    fig.suptitle(f"{title}{suffix}", fontsize=15, fontweight="bold",
+                 color=TEXT_COLOR, y=1.02)
+    if legend_handles:
+        ncol = min(3, max(1, (len(legend_handles) + 2) // 3))
+        fig.legend(list(legend_handles.values()), list(legend_handles.keys()),
+                   loc="lower center", ncol=ncol, fontsize=9,
+                   framealpha=0.95, edgecolor="#CCCCCC", fancybox=True,
+                   title="Family | scaling",
+                   bbox_to_anchor=(0.5, -0.05))
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.18)
+    fig.subplots_adjust(bottom=0.24)
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -454,18 +612,17 @@ def plot_lines_dual_regime(df, metric, title, ylabel, save_path, lower_is_better
 def plot_final_comparison(df, regime, save_path):
     """
     Final comparative chart: three panels (MAPE | Directional Accuracy |
-    Final-Return MAE in pp), one line per family, showing the best single run
-    at each horizon. Each data point is annotated with the winning variant's
-    key params.
+    Final-Return MAE in pp), one line per *full* family (model + strategy +
+    scaling config), best single run at each horizon.
+
+    The same set of families appears in all three panels: families are ranked
+    by average rank across the three metrics and the top MAX_LINES are kept.
+    Each data point is annotated with the winning variant's remaining params
+    (L, patch length, recursive step) — scaling info is in the legend.
     """
     subset = df[df["regime"] == regime].copy()
     if subset.empty:
         return
-
-    families = [f for f in FAMILY_ORDER if f in subset["family"].unique()]
-    families += [f for f in subset["family"].unique() if f not in FAMILY_ORDER]
-
-    fig, axes = plt.subplots(1, 3, figsize=(28, 7))
 
     metrics_cfg = [
         ("mape",                 True,  "MAPE",                          "lower = better"),
@@ -473,38 +630,44 @@ def plot_final_comparison(df, regime, save_path):
         ("final_return_mae",     True,  "Final-Return MAE (pp)",         "lower = better"),
     ]
 
-    for ax, (metric, lower_is_better, ylabel, hint) in zip(axes, metrics_cfg):
-        valid = subset.dropna(subset=[metric])
-        if valid.empty:
-            ax.set_title(f"{ylabel} — no data")
-            continue
+    metric_specs = [(m, lib) for m, lib, _, _ in metrics_cfg]
+    top_families, best_by_metric, total_families = _pick_top_full_families_multi(
+        subset, metric_specs, max_lines=MAX_LINES
+    )
+    if not top_families:
+        return
 
-        if lower_is_better:
-            best_idx = valid.groupby(["family", "H"])[metric].idxmin()
-        else:
-            best_idx = valid.groupby(["family", "H"])[metric].idxmax()
-        best     = valid.loc[best_idx]
+    fig, axes = plt.subplots(1, 3, figsize=(28, 7))
+    legend_handles: dict[str, object] = {}
+
+    for ax, (metric, _lower_is_better, ylabel, hint) in zip(axes, metrics_cfg):
+        best = best_by_metric.get(metric)
+        if best is None or best.empty:
+            ax.set_title(f"{ylabel} — no data", fontsize=13, color=TEXT_COLOR)
+            ax.grid(True, alpha=0.3)
+            continue
         horizons = sorted(best["H"].unique())
 
-        for family in families:
-            fam_data = best[best["family"] == family].sort_values("H")
+        for family_full in top_families:
+            fam_data = best[best["family_full"] == family_full].sort_values("H")
             if fam_data.empty:
                 continue
+            rep = fam_data.iloc[0]
+            color, linestyle, marker = style_for_full_family(rep)
             h_vals = fam_data["H"].tolist()
             m_vals = fam_data[metric].tolist()
-            color  = get_color(family)
-            marker = FAMILY_MARKERS.get(family, "o")
-            label  = FAMILY_LABELS.get(family, family)
-
-            ax.plot(h_vals, m_vals, color=color, marker=marker, markersize=9,
-                    linewidth=2.4, label=label, zorder=3)
+            line, = ax.plot(h_vals, m_vals,
+                            color=color, marker=marker, markersize=8,
+                            linewidth=2.2, linestyle=linestyle,
+                            label=family_full, zorder=3)
+            legend_handles.setdefault(family_full, line)
             for h, m, (_, row) in zip(h_vals, m_vals, fam_data.iterrows()):
                 vl = variant_label(row)
                 ax.annotate(
-                    f"{m:.4f}\n({vl})",
+                    f"{m:.3f}\n({vl})" if vl else f"{m:.3f}",
                     (h, m),
                     textcoords="offset points",
-                    xytext=(0, 12),
+                    xytext=(0, 10),
                     ha="center",
                     fontsize=6.5,
                     color=color,
@@ -517,18 +680,27 @@ def plot_final_comparison(df, regime, save_path):
         ax.set_ylabel(ylabel, fontsize=12)
         ax.set_title(f"{ylabel}\n({hint})", fontsize=13, fontweight="bold",
                      color=TEXT_COLOR)
-        ax.legend(loc="best", fontsize=8.5, framealpha=0.9,
-                  edgecolor="#CCCCCC", fancybox=True)
         ax.grid(True, alpha=0.3)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
     regime_label = "Bear Market (2022)" if regime == "bear" else "Bull Market (2023)"
+    suffix = ""
+    if total_families > len(top_families):
+        suffix = f"  (showing top {len(top_families)} of {total_families} families by avg rank)"
     fig.suptitle(
-        f"Final Comparison — Best Run per Family\n{regime_label}",
+        f"Final Comparison — Best Run per Full Family\n{regime_label}{suffix}",
         fontsize=15, fontweight="bold", color=TEXT_COLOR, y=1.02,
     )
+    if legend_handles:
+        ncol = min(4, max(2, (len(legend_handles) + 1) // 2))
+        fig.legend(list(legend_handles.values()), list(legend_handles.keys()),
+                   loc="lower center", ncol=ncol, fontsize=9,
+                   framealpha=0.95, edgecolor="#CCCCCC", fancybox=True,
+                   title="Family | scaling",
+                   bbox_to_anchor=(0.5, -0.04))
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -560,36 +732,40 @@ def print_selection_table(
     print(sep)
 
     col_w = max(len(short_family_label(f)) for f in FAMILY_ORDER) + 2
+    scale_w = 18
+
+    def _scale_tag(row) -> str:
+        return f"g={_global_scaler_value(row)} w={_window_scaling_value(row)}"
 
     # MAPE table
     print(f"  {'Best by MAPE':}")
-    print(f"  {'Family':<{col_w}}  {'MAPE':>10}  {'Run ID'}")
-    print(f"  {'-' * col_w}  {'----------'}  {'--------------------'}")
+    print(f"  {'Family':<{col_w}}  {'Scaling':<{scale_w}}  {'MAPE':>10}  {'Run ID'}")
+    print(f"  {'-' * col_w}  {'-' * scale_w}  {'----------'}  {'--------------------'}")
     for _, row in best_mape.sort_values("mape").iterrows():
         fam = short_family_label(row["family"])
-        print(f"  {fam:<{col_w}}  {row['mape']:>10.4f}  {row['run_id']}")
+        print(f"  {fam:<{col_w}}  {_scale_tag(row):<{scale_w}}  {row['mape']:>10.4f}  {row['run_id']}")
 
     print()
 
     # DA table
     print(f"  {'Best by Directional Accuracy':}")
-    print(f"  {'Family':<{col_w}}  {'Dir.Acc.':>10}  {'Run ID'}")
-    print(f"  {'-' * col_w}  {'----------'}  {'--------------------'}")
+    print(f"  {'Family':<{col_w}}  {'Scaling':<{scale_w}}  {'Dir.Acc.':>10}  {'Run ID'}")
+    print(f"  {'-' * col_w}  {'-' * scale_w}  {'----------'}  {'--------------------'}")
     for _, row in best_da.sort_values("directional_accuracy", ascending=False).iterrows():
         fam = short_family_label(row["family"])
-        print(f"  {fam:<{col_w}}  {row['directional_accuracy']:>10.4f}  {row['run_id']}")
+        print(f"  {fam:<{col_w}}  {_scale_tag(row):<{scale_w}}  {row['directional_accuracy']:>10.4f}  {row['run_id']}")
 
     print()
 
     # Final-Return MAE table (already in percentage points; lower = better)
     print(f"  {'Best by Final-Return MAE (percentage points)':}")
-    print(f"  {'Family':<{col_w}}  {'FRet MAE':>10}  {'Run ID'}")
-    print(f"  {'-' * col_w}  {'----------'}  {'--------------------'}")
+    print(f"  {'Family':<{col_w}}  {'Scaling':<{scale_w}}  {'FRet MAE':>10}  {'Run ID'}")
+    print(f"  {'-' * col_w}  {'-' * scale_w}  {'----------'}  {'--------------------'}")
     for _, row in best_frmae.sort_values("final_return_mae").iterrows():
         fam = short_family_label(row["family"])
         val = row["final_return_mae"]
         val_str = "—" if pd.isna(val) else f"{val:>9.4f}pp"
-        print(f"  {fam:<{col_w}}  {val_str:>10}  {row['run_id']}")
+        print(f"  {fam:<{col_w}}  {_scale_tag(row):<{scale_w}}  {val_str:>10}  {row['run_id']}")
 
 
 # ── Collect best runs ─────────────────────────────────────────────────────────
@@ -654,14 +830,16 @@ def main():
         print("No valid runs found.")
         return
 
-    df["family"] = df.apply(build_family_label, axis=1)
+    df["family"]      = df.apply(base_family_label, axis=1)
+    df["family_full"] = df.apply(full_family_label, axis=1)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"\nLoaded {len(df)} runs")
-    print(f"Families : {sorted(df['family'].unique())}")
-    print(f"Regimes  : {sorted(df['regime'].unique())}")
-    print(f"Horizons : {sorted(df['H'].unique())}")
+    print(f"Base families : {sorted(df['family'].unique())}")
+    print(f"Full families : {df['family_full'].nunique()} unique  (line plots cap at {MAX_LINES})")
+    print(f"Regimes       : {sorted(df['regime'].unique())}")
+    print(f"Horizons      : {sorted(df['H'].unique())}")
 
     # ── Per-(regime, H) selection ─────────────────────────────────────────────
     best_dir = out / "best_of_family"
