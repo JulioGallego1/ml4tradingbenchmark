@@ -7,8 +7,8 @@ regimes:
 
 horizons:
   #- 1
-  #- 10    # 2w
-  - 21    # 1m
+  - 10    # 2w
+  #- 21    # 1m
   #- 63    # 3m
 
 context_lengths:
